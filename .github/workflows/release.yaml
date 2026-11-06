@@ -13,8 +13,8 @@ on:
 
 permissions: {}
 
-# GitHub-hosted runners: a public repository's jobs never use our self-hosted ones (QB-4151,
-# development's CONVENTIONS). Nothing here needs our AWS account.
+# GitHub-hosted runners: a public repository's jobs never use our self-hosted ones (QB-4151).
+# Nothing here needs our AWS account.
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
@@ -59,7 +59,7 @@ jobs:
         with:
           name: tarball
           path: dist
-      # Pinned by commit: the one third-party action, in the only job that can write releases
+      # Pinned by commit: the one third-party action, in the only job that can write releases.
       - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: dist/*.tgz
