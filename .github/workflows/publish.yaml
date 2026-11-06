@@ -1,0 +1,29 @@
+name: Publish
+
+# A v* tag publishes that version to GitHub Packages. The tag must match package.json's version,
+# so what a consumer pins is what the tag holds.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: [self-hosted, arm64, codebuild, small]
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag is package.json's version
+        run: |
+          version="v$(node -p 'require("./package.json").version')"
+          [ "$version" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, package.json $version"; exit 1; }
+      - run: npm ci
+      - run: npm test
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          npm publish
