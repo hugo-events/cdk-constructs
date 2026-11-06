@@ -13,9 +13,11 @@ on:
 
 permissions: {}
 
+# GitHub-hosted runners: a public repository's jobs never use our self-hosted ones (QB-4151).
+# Nothing here needs our AWS account.
 jobs:
   build:
-    runs-on: [self-hosted, arm64, codebuild, small]
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
     steps:
@@ -23,8 +25,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # The handler runs on Lambda's Node 22, and the runners carry the newest Node (26), on which
-      # jest 29 ran out of memory: test on the runtime's.
+      # The handler runs on Lambda's Node 22: test on the runtime's.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -50,7 +51,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: [self-hosted, arm64, codebuild, small]
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: write
     steps:
@@ -58,7 +59,8 @@ jobs:
         with:
           name: tarball
           path: dist
-      - uses: softprops/action-gh-release@v3
+      # Pinned by commit: the one third-party action, in the only job that can write releases.
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           files: dist/*.tgz
           generate_release_notes: true

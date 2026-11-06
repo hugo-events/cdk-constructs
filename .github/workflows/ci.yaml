@@ -10,11 +10,14 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, arm64, codebuild, small]
+    # GitHub-hosted, never our self-hosted runners: the repository is public, and a fork's pull
+    # request would run its code on them (QB-4151). Nothing here needs our AWS account.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      # The handler runs on Lambda's Node 22, and the runners carry the newest Node (26), on which
-      # jest 29 ran out of memory: test on the runtime's.
+        with:
+          persist-credentials: false
+      # The handler runs on Lambda's Node 22: test on the runtime's.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
