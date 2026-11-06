@@ -15,7 +15,6 @@ export const options = {
   banner: { js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
   external: ["@aws-sdk/*"],
   legalComments: "none",
-  minify: true,
 };
 
 for (const name of handlers) {

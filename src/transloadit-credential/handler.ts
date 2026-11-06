@@ -4,7 +4,7 @@
 //
 // Nothing secret travels in the event: the provider framework logs every event it relays, so the
 // IAM key's secret is read here from its own secret (KeySecretArn), and the Transloadit API key
-// from ApiSecretId. Neither, nor the credential listing (which carries every credential's key and
+// from ApiSecretArn. Neither, nor the credential listing (which carries every credential's key and
 // secret), nor an SDK error's `cause` (the HTTP request, body included) is ever logged or put in
 // an error message.
 //
@@ -14,10 +14,17 @@
 // id, and creates it only when there is none. The SDK's streamTemplateCredentials would never end.
 
 export interface CredentialClient {
-  listTemplateCredentials(): Promise<{ credentials?: { id: string; name: string; deleted?: unknown }[] }>;
+  listTemplateCredentials(): Promise<{ credentials?: ListedCredential[] }>;
   editTemplateCredential(id: string, params: CredentialParams): Promise<{ ok?: string }>;
   createTemplateCredential(params: CredentialParams): Promise<{ ok?: string }>;
   deleteTemplateCredential(id: string): Promise<{ ok?: string }>;
+}
+
+interface ListedCredential {
+  id: string;
+  name: string;
+  deleted?: unknown;
+  content?: { key?: string } | string;
 }
 
 interface CredentialParams {
@@ -32,8 +39,10 @@ export interface Deps {
 }
 
 export interface Props {
-  ApiSecretId: string;
+  ApiSecretArn: string;
   KeySecretArn: string;
+  // the key this resource holds; a rotation changes it
+  AccessKeyId: string;
   CredentialName: string;
   S3Bucket: string;
   S3BucketRegion: string;
@@ -42,11 +51,9 @@ export interface Props {
   DeleteWithStack?: string;
 }
 
-interface Event {
-  RequestType: "Create" | "Update" | "Delete";
-  PhysicalResourceId?: string;
-  ResourceProperties: Props;
-}
+type Event =
+  | { RequestType: "Create"; ResourceProperties: Props }
+  | { RequestType: "Update" | "Delete"; PhysicalResourceId: string; ResourceProperties: Props };
 
 // A secret's JSON fields; the parse error is not passed on, as V8 quotes the input in it.
 async function readSecret(deps: Deps, secretId: string, fields: string[]): Promise<Record<string, string>> {
@@ -80,8 +87,22 @@ async function call<T>(what: string, request: () => Promise<T>): Promise<T> {
 }
 
 async function apiClient(deps: Deps, props: Props): Promise<CredentialClient> {
-  const api = await readSecret(deps, props.ApiSecretId, ["TRANSLOADIT_AUTH_KEY", "TRANSLOADIT_AUTH_SECRET"]);
+  const api = await readSecret(deps, props.ApiSecretArn, ["TRANSLOADIT_AUTH_KEY", "TRANSLOADIT_AUTH_SECRET"]);
   return deps.client({ authKey: api.TRANSLOADIT_AUTH_KEY, authSecret: api.TRANSLOADIT_AUTH_SECRET });
+}
+
+// The access key id a listed credential holds; its content may come as JSON text.
+function credentialKey(credential: ListedCredential): string | undefined {
+  const content = typeof credential.content === "string" ? safeParse(credential.content) : credential.content;
+  return content?.key;
+}
+
+function safeParse(text: string): { key?: string } | undefined {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
 // The live credentials with the name; more than one is refused, as which one a template resolves
@@ -99,6 +120,10 @@ async function named(client: CredentialClient, name: string) {
 export async function writeCredential(deps: Deps, props: Props): Promise<"updated" | "created"> {
   const client = await apiClient(deps, props);
   const key = await readSecret(deps, props.KeySecretArn, ["accessKeyId", "secretAccessKey"]);
+  if (key.accessKeyId !== props.AccessKeyId) {
+    // the secret holds another key than the template does (a rollback mid-rotation): write nothing
+    throw new Error(`secret ${props.KeySecretArn} holds key ${key.accessKeyId}, not ${props.AccessKeyId}`);
+  }
   const existing = await named(client, props.CredentialName);
   const params: CredentialParams = {
     name: props.CredentialName,
@@ -123,7 +148,7 @@ export async function writeCredential(deps: Deps, props: Props): Promise<"update
 export async function onEvent(deps: Deps, event: Event): Promise<{ PhysicalResourceId: string }> {
   const props = event.ResourceProperties;
   if (event.RequestType === "Delete") {
-    const physicalId = event.PhysicalResourceId || props.CredentialName;
+    const physicalId = event.PhysicalResourceId;
     if (props.DeleteWithStack !== "true") {
       // left in Transloadit: deleting it would stop every upload; a renamed credential is the
       // old one's to remove by hand
@@ -134,8 +159,17 @@ export async function onEvent(deps: Deps, event: Event): Promise<{ PhysicalResou
     try {
       const client = await apiClient(deps, props);
       const existing = await named(client, physicalId);
-      if (existing) await call("delete", () => client.deleteTemplateCredential(existing.id));
-      console.log("deleted", physicalId);
+      if (!existing) {
+        console.log("none named", physicalId);
+      } else if (credentialKey(existing) !== props.AccessKeyId) {
+        // another resource wrote it since (this one moved or was replaced, and the new one ran
+        // first): the credential is live, and not this resource's to delete
+        console.log("left in Transloadit:", physicalId, "holds another key");
+      } else {
+        const res = await call("delete", () => client.deleteTemplateCredential(existing.id));
+        if (res.ok === "TEMPLATE_CREDENTIALS_DELETED") console.log("deleted", physicalId);
+        else console.log("left in Transloadit:", physicalId, res.ok || "no ok");
+      }
     } catch (err) {
       console.log("left in Transloadit:", physicalId, (err as Error).message);
     }
@@ -145,6 +179,8 @@ export async function onEvent(deps: Deps, event: Event): Promise<{ PhysicalResou
   return { PhysicalResourceId: props.CredentialName };
 }
 
+export const clientOptions = { timeout: 8000, maxRetries: 1, gotRetry: { limit: 0 } };
+
 export async function handler(event: Event) {
   // the Lambda runtime's AWS SDK, and Transloadit's, bundled; imported here so the tests need neither
   const { SecretsManagerClient, GetSecretValueCommand } = await import("@aws-sdk/client-secrets-manager");
@@ -153,7 +189,9 @@ export async function handler(event: Event) {
   return onEvent(
     {
       getSecret: async (id) => (await secrets.send(new GetSecretValueCommand({ SecretId: id }))).SecretString,
-      client: (auth) => new Transloadit(auth) as unknown as CredentialClient,
+      // short requests and no retries but one on a rate limit, so the worst case ends inside the
+      // Lambda's timeout with Transloadit's own message (the SDK waits 60 s and retries 5 times)
+      client: (auth) => new Transloadit({ ...auth, ...clientOptions }) as unknown as CredentialClient,
     },
     event
   );

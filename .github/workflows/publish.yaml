@@ -15,6 +15,13 @@ jobs:
     runs-on: [self-hosted, arm64, codebuild, small]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # What production installs is what was reviewed: a tag on a commit that never reached master
+      # publishes nothing.
+      - name: The tag is on master
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master || { echo "::error::$GITHUB_REF_NAME is not on master"; exit 1; }
       - name: The tag is package.json's version
         run: |
           version="v$(node -p 'require("./package.json").version')"

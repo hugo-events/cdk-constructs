@@ -94,7 +94,7 @@ export class TransloaditCredential extends Construct {
       properties: {
         // a new handler updates the function but not the resource; this makes it run again
         HandlerHash: transloaditHandlerHash(),
-        ApiSecretId: props.apiSecret.secretArn,
+        ApiSecretArn: props.apiSecret.secretArn,
         KeySecretArn: this.keySecret.secretArn,
         // not secret; a new key changes it, so a rotation runs the handler
         AccessKeyId: key.ref,
@@ -115,7 +115,12 @@ export class TransloaditCredentialProvider extends Construct {
   public static of(scope: Construct): TransloaditCredentialProvider {
     const stack = cdk.Stack.of(scope);
     const id = "TransloaditCredentialProvider";
-    return (stack.node.tryFindChild(id) as TransloaditCredentialProvider) ?? new TransloaditCredentialProvider(stack, id);
+    const existing = stack.node.tryFindChild(id);
+    if (existing === undefined) return new TransloaditCredentialProvider(stack, id);
+    if (!(existing instanceof TransloaditCredentialProvider)) {
+      throw new Error(`${stack.node.path}/${id} is taken by another construct`);
+    }
+    return existing;
   }
 
   public readonly handler: lambda.Function;
@@ -128,7 +133,9 @@ export class TransloaditCredentialProvider extends Construct {
       architecture: lambda.Architecture.ARM_64,
       handler: "index.handler",
       code: lambda.Code.fromAsset(handlerDir),
-      timeout: cdk.Duration.seconds(30),
+      // a listing and a write: two 8 s requests each, plus one rate-limit wait (the handler's
+      // clientOptions)
+      timeout: cdk.Duration.minutes(2),
       description: "Writes an IAM key into a Transloadit template credential",
       logGroup: new logs.LogGroup(this, "HandlerLogs", {
         retention: logs.RetentionDays.THREE_MONTHS,
@@ -145,6 +152,6 @@ export class TransloaditCredentialProvider extends Construct {
   }
 }
 
-export function transloaditHandlerHash(): string {
+function transloaditHandlerHash(): string {
   return crypto.createHash("sha256").update(fs.readFileSync(path.join(handlerDir, "index.mjs"))).digest("hex");
 }

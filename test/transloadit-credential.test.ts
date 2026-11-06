@@ -1,4 +1,6 @@
 import * as childProcess from "child_process";
+import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -6,11 +8,11 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import { Match, Template } from "aws-cdk-lib/assertions";
 // The built package, as a consumer gets it: the construct deploys the bundle in lib/.
 import { TransloaditCredential, TransloaditCredentialProvider } from "../lib";
-import { CredentialClient, onEvent } from "../src/transloadit-credential/handler";
+import { clientOptions, CredentialClient, onEvent } from "../src/transloadit-credential/handler";
 
 // QB-4147: Transloadit stores uploads with a key CloudFormation makes and writes into the
 // credential the templates name, so a key rotation can never leave Transloadit holding a dead key.
-function stackWith(credentials: { name: string; deleteWithStack?: boolean; userName?: string }[]) {
+function stackWith(credentials: { name: string; deleteWithStack?: boolean; userName?: string; keySerial?: number }[]) {
   const app = new cdk.App();
   const stack = new cdk.Stack(app, "Stack", { env: { account: "111111111111", region: "eu-west-1" } });
   const apiSecret = secretsmanager.Secret.fromSecretNameV2(stack, "Api", "quriobot/transloadit-api");
@@ -21,6 +23,7 @@ function stackWith(credentials: { name: string; deleteWithStack?: boolean; userN
       apiSecret,
       userName: c.userName,
       deleteWithStack: c.deleteWithStack,
+      keySerial: c.keySerial,
     });
   }
   return { stack, template: Template.fromStack(stack) };
@@ -35,7 +38,7 @@ describe("TransloaditCredential", () => {
       ServiceToken: expect.anything(),
       HandlerHash: expect.stringMatching(/^[0-9a-f]{64}$/),
       // the secret's ARN, so a cross-account secret is found too
-      ApiSecretId: expect.anything(),
+      ApiSecretArn: expect.anything(),
       KeySecretArn: { Ref: expect.stringMatching(/AccessKeySecret/) },
       AccessKeyId: { Ref: expect.stringMatching(/AccessKey[0-9A-F]{8}$/) },
       CredentialName: "media-production",
@@ -43,7 +46,7 @@ describe("TransloaditCredential", () => {
       S3BucketRegion: "eu-west-1",
       DeleteWithStack: "false",
     });
-    expect(JSON.stringify(resource.Properties.ApiSecretId)).toContain(":secret:quriobot/transloadit-api");
+    expect(JSON.stringify(resource.Properties.ApiSecretArn)).toContain(":secret:quriobot/transloadit-api");
     expect(JSON.stringify(resource.Properties)).not.toContain("SecretAccessKey");
   });
 
@@ -77,6 +80,20 @@ describe("TransloaditCredential", () => {
     template.hasResourceProperties("AWS::IAM::User", { UserName: "media-transloadit" });
   });
 
+  test("lets the handler read the API secret and the key's secret", () => {
+    const [keySecret] = Object.keys(template.findResources("AWS::SecretsManager::Secret"));
+    const policies = Object.values(template.findResources("AWS::IAM::Policy")) as any[];
+    const handlerPolicy = policies.find((p) => JSON.stringify(p.Properties.Roles ?? []).includes("TransloaditCredentialProviderHandler"));
+    const reads = handlerPolicy.Properties.PolicyDocument.Statement.filter((st: any) => ([] as string[]).concat(st.Action).includes("secretsmanager:GetSecretValue"));
+    const resources = JSON.stringify(reads.map((st: any) => st.Resource));
+    expect(resources).toContain(":secret:quriobot/transloadit-api");
+    expect(resources).toContain(keySecret);
+  });
+
+  test("makes a new key when the serial is bumped", () => {
+    stackWith([{ name: "rotated", keySerial: 2 }]).template.hasResourceProperties("AWS::IAM::AccessKey", { Serial: 2 });
+  });
+
   test("runs the bundled handler on Node 22, arm64, with bounded logs", () => {
     template.hasResourceProperties("AWS::Lambda::Function", { Runtime: "nodejs22.x", Architectures: ["arm64"], Handler: "index.handler" });
     const groups = Object.values(template.findResources("AWS::Logs::LogGroup")) as any[];
@@ -97,23 +114,35 @@ describe("TransloaditCredential", () => {
   });
 });
 
-// The bundle the construct deploys, run in Node: the SDK is ESM-only, and a bundle that cannot
-// load it fails only once deployed.
-test("the handler's bundle loads Transloadit's SDK and answers a Delete without calling it", () => {
-  const bundle = path.join(__dirname, "..", "lib", "transloadit-credential", "handler", "index.mjs");
-  const event = JSON.stringify({ RequestType: "Delete", PhysicalResourceId: "kept", ResourceProperties: { CredentialName: "kept" } });
-  const result = childProcess.execFileSync(
-    process.execPath,
-    ["--input-type=module", "-e", `const m = await import(${JSON.stringify(bundle)}); console.log(JSON.stringify(await m.handler(${event})));`],
-    { cwd: path.join(__dirname, ".."), stdio: "pipe" }
-  );
-  expect(JSON.parse(result.toString().trim())).toEqual({ PhysicalResourceId: "kept" });
+// The bundle the construct deploys, run in Node from a directory that holds nothing but the
+// Lambda runtime's @aws-sdk: the SDK is ESM-only, and a bundle that needs anything else, or cannot
+// load it, fails only once deployed.
+test("the handler's bundle runs on its own and answers a Delete without calling Transloadit", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "transloadit-bundle-"));
+  try {
+    fs.copyFileSync(path.join(__dirname, "..", "lib", "transloadit-credential", "handler", "index.mjs"), path.join(dir, "index.mjs"));
+    fs.mkdirSync(path.join(dir, "node_modules"));
+    fs.symlinkSync(path.join(__dirname, "..", "node_modules", "@aws-sdk"), path.join(dir, "node_modules", "@aws-sdk"));
+    const event = JSON.stringify({ RequestType: "Delete", PhysicalResourceId: "kept", ResourceProperties: { CredentialName: "kept" } });
+    const result = childProcess.execFileSync(
+      process.execPath,
+      ["--input-type=module", "-e", `const m = await import("./index.mjs"); console.log(JSON.stringify(await m.handler(${event})));`],
+      { cwd: dir, stdio: "pipe" }
+    );
+    expect(JSON.parse(result.toString().trim())).toEqual({ PhysicalResourceId: "kept" });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the SDK client gives up within the Lambda's time", () => {
+  expect(clientOptions).toEqual({ timeout: 8000, maxRetries: 1, gotRetry: { limit: 0 } });
 });
 
 const API_SECRET = "transloadit-api-secret-value";
 const S3_SECRET = "iam-secret-access-key-value";
 const props = {
-  ApiSecretId: "quriobot/transloadit-api",
+  ApiSecretArn: "quriobot/transloadit-api",
   KeySecretArn: "arn:key-secret",
   AccessKeyId: "AKIAEXAMPLE",
   CredentialName: "quriobot-media-production",
@@ -162,6 +191,7 @@ function apiError(message: string) {
 
 const listing = (...credentials: unknown[]) => ({ ok: "TEMPLATE_CREDENTIALS_FOUND", credentials });
 const create = { RequestType: "Create" as const, ResourceProperties: props };
+const owned = { ...props, DeleteWithStack: "true" };
 
 describe("the Transloadit credential handler", () => {
   let logs: string[];
@@ -199,7 +229,7 @@ describe("the Transloadit credential handler", () => {
       listTemplateCredentials: [listing({ id: "gone", name: props.CredentialName, deleted: "2026-10-01 00:00:00" })],
       createTemplateCredential: [{ ok: "TEMPLATE_CREDENTIALS_CREATED" }],
     });
-    await onEvent(t.deps, { ...create, RequestType: "Update" });
+    await onEvent(t.deps, { ...create, RequestType: "Update", PhysicalResourceId: props.CredentialName });
     expect(t.ops()).toEqual(["listTemplateCredentials", "createTemplateCredential"]);
     expect((t.calls[1].args[0] as { name: string }).name).toBe(props.CredentialName);
     expect(logs).toEqual(["created quriobot-media-production"]);
@@ -214,7 +244,7 @@ describe("the Transloadit credential handler", () => {
   test.each([
     ["listing", { listTemplateCredentials: [apiError("API error (HTTP 403) GET_ACCOUNT_UNKNOWN_AUTH_KEY: unknown key")] }],
     ["update", { listTemplateCredentials: [listing({ id: "abc123", name: props.CredentialName })], editTemplateCredential: [apiError("API error (HTTP 400) TEMPLATE_CREDENTIALS_NOT_UPDATED: no")] }],
-    ["create", { listTemplateCredentials: [listing()], createTemplateCredential: [apiError("API error (HTTP 400) TEMPLATE_CREDENTIALS_NOT_SAVED: no")] }],
+    ["create", { listTemplateCredentials: [listing()], createTemplateCredential: [apiError("API error (HTTP 400) TEMPLATE_CREDENTIALS_NOT_CREATED: no")] }],
     ["update", { listTemplateCredentials: [listing({ id: "abc123", name: props.CredentialName })], editTemplateCredential: [{ ok: "SOMETHING_ELSE" }] }],
     ["create", { listTemplateCredentials: [listing()], createTemplateCredential: [{}] }],
   ] as [string, Partial<Record<keyof CredentialClient, Answer[]>>][])("fails the deploy when Transloadit refuses the %s", async (what, answers) => {
@@ -247,6 +277,12 @@ describe("the Transloadit credential handler", () => {
     expect(t.calls).toHaveLength(0);
   });
 
+  test("fails, calling nothing, when the key's secret holds another key than the template", async () => {
+    const t = fakeTransloadit({}, { ...secrets, "arn:key-secret": JSON.stringify({ accessKeyId: "AKIAOLD", secretAccessKey: S3_SECRET }) });
+    await expect(onEvent(t.deps, create)).rejects.toThrow("secret arn:key-secret holds key AKIAOLD, not AKIAEXAMPLE");
+    expect(t.calls).toHaveLength(0);
+  });
+
   test("leaves production's credential in Transloadit on Delete", async () => {
     const t = fakeTransloadit({});
     expect(await onEvent(t.deps, { RequestType: "Delete", PhysicalResourceId: "old-name", ResourceProperties: props })).toEqual({
@@ -255,19 +291,36 @@ describe("the Transloadit credential handler", () => {
     expect(t.calls).toHaveLength(0);
   });
 
-  test("deletes a credential the stack owns on Delete, and never fails the removal", async () => {
-    const owned = { ...props, DeleteWithStack: "true" };
+  test("deletes a credential the stack owns on Delete when it still holds this resource's key", async () => {
     const t = fakeTransloadit({
-      listTemplateCredentials: [listing({ id: "abc123", name: "dev-media" })],
+      listTemplateCredentials: [listing({ id: "abc123", name: "dev-media", content: { key: "AKIAEXAMPLE" } })],
       deleteTemplateCredential: [{ ok: "TEMPLATE_CREDENTIALS_DELETED" }],
     });
     await onEvent(t.deps, { RequestType: "Delete", PhysicalResourceId: "dev-media", ResourceProperties: owned });
     expect(t.calls.map((c) => [c.op, ...c.args])).toEqual([["listTemplateCredentials"], ["deleteTemplateCredential", "abc123"]]);
+    expect(logs).toEqual(["deleted dev-media"]);
+  });
 
-    const failing = fakeTransloadit({ listTemplateCredentials: [apiError("API error (HTTP 500) INTERNAL: down")] });
-    expect(await onEvent(failing.deps, { RequestType: "Delete", PhysicalResourceId: "dev-media", ResourceProperties: owned })).toEqual({
+  test("leaves a credential another resource has written since, as a moved resource's Delete comes last", async () => {
+    const t = fakeTransloadit({ listTemplateCredentials: [listing({ id: "abc123", name: "dev-media", content: '{"key":"AKIANEW"}' })] });
+    await onEvent(t.deps, { RequestType: "Delete", PhysicalResourceId: "dev-media", ResourceProperties: owned });
+    expect(t.ops()).toEqual(["listTemplateCredentials"]);
+    expect(logs).toEqual(["left in Transloadit: dev-media holds another key"]);
+  });
+
+  test.each([
+    ["no credential has the name", { listTemplateCredentials: [listing()] }, "none named dev-media"],
+    [
+      "Transloadit answers the delete without deleting",
+      { listTemplateCredentials: [listing({ id: "abc123", name: "dev-media", content: { key: "AKIAEXAMPLE" } })], deleteTemplateCredential: [{}] },
+      "left in Transloadit: dev-media no ok",
+    ],
+    ["Transloadit fails", { listTemplateCredentials: [apiError("API error (HTTP 500) INTERNAL: down")] }, "left in Transloadit: dev-media Transloadit refused the listing: API error (HTTP 500) INTERNAL: down"],
+  ] as [string, Partial<Record<keyof CredentialClient, Answer[]>>, string][])("never fails a stack's removal: %s", async (_, answers, line) => {
+    const t = fakeTransloadit(answers);
+    expect(await onEvent(t.deps, { RequestType: "Delete", PhysicalResourceId: "dev-media", ResourceProperties: owned })).toEqual({
       PhysicalResourceId: "dev-media",
     });
-    expect(logs.at(-1)).toMatch(/^left in Transloadit: dev-media Transloadit refused the listing: /);
+    expect(logs).toEqual([line]);
   });
 });
