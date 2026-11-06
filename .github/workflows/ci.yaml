@@ -10,9 +10,16 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, arm64, codebuild, small]
+    # medium, as the infrastructure repos' test shards: synthesising aws-cdk-lib stacks and
+    # type-checking against it outgrew small's memory
+    runs-on: [self-hosted, arm64, codebuild, medium]
     steps:
       - uses: actions/checkout@v4
+      - run: node --version && free -m
       - run: npm ci
-      # builds, bundles the handlers, type-checks and runs jest
-      - run: npm test
+      - name: Build
+        run: npx tsc -p tsconfig.build.json --extendedDiagnostics && node scripts/bundle-handlers.mjs
+      - name: Type-check
+        run: npx tsc -p tsconfig.json
+      - name: Test
+        run: npx jest

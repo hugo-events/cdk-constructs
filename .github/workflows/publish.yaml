@@ -12,7 +12,9 @@ permissions:
 
 jobs:
   publish:
-    runs-on: [self-hosted, arm64, codebuild, small]
+    # medium, as the infrastructure repos' test shards: synthesising aws-cdk-lib stacks and
+    # type-checking against it outgrew small's memory
+    runs-on: [self-hosted, arm64, codebuild, medium]
     steps:
       - uses: actions/checkout@v4
         with:
