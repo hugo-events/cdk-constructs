@@ -1,6 +1,6 @@
 {
   "name": "@hugo-events/cdk-constructs",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Shared AWS CDK constructs for Quriobot and Hugo infrastructure",
   "repository": {
     "type": "git",
@@ -14,9 +14,6 @@
     "lib/**/*.d.ts",
     "lib/**/*.mjs"
   ],
-  "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
-  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/bundle-handlers.mjs",
     "test": "npm run build && tsc -p tsconfig.json && jest",
