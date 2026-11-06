@@ -1,0 +1,65 @@
+name: Release
+
+# A v* tag releases that version: the npm pack tarball, attached to the tag's GitHub release, which
+# consumers install by its URL. The repository is public, so installing needs no token anywhere
+# (GitHub Packages' npm registry asks for one even for a public package). The tag must match
+# package.json's version and sit on master, so what a consumer pins is what was reviewed.
+#
+# Two jobs, so the token that can write releases is never in reach of npm: `build` installs, tests
+# and packs with a read-only token it does not keep; `release` only attaches the tarball.
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: [self-hosted, arm64, codebuild, small]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The handler runs on Lambda's Node 22, and the runners carry the newest Node (26), on which
+      # jest 29 ran out of memory: test on the runtime's.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The tag is on master
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master || { echo "::error::$GITHUB_REF_NAME is not on master"; exit 1; }
+      - name: The tag is package.json's version
+        run: |
+          version="v$(node -p 'require("./package.json").version')"
+          [ "$version" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, package.json $version"; exit 1; }
+      - run: npm ci
+      - run: npm test
+      - name: Pack
+        run: |
+          tarball=$(npm pack --silent)
+          test -f "$tarball" || { echo "::error::npm pack made no tarball"; exit 1; }
+          mkdir dist && mv "$tarball" dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: [self-hosted, arm64, codebuild, small]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: dist
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.tgz
+          generate_release_notes: true
+          fail_on_unmatched_files: true

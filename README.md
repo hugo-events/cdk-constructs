@@ -1,8 +1,8 @@
 # @hugo-events/cdk-constructs
 
 AWS CDK constructs shared by Quriobot's and Hugo's infrastructure (`quriobot-infrastructure`,
-`hugo-infrastructure`, and the `development` repository's developer stacks). Published to
-GitHub Packages from a `v*` tag.
+`hugo-infrastructure`, and the `development` repository's developer stacks). Released as a tarball
+on each `v*` tag's GitHub release.
 
 ## Constructs
 
@@ -38,24 +38,21 @@ The handler is bundled with its dependencies when the package is built
 
 ## Installing
 
-GitHub Packages needs a token even to install. Map the scope in the consumer's committed `.npmrc`:
+Each version is the `npm pack` tarball attached to its GitHub release. The repository is public,
+so installing needs no token:
 
+```sh
+npm install https://github.com/hugo-events/cdk-constructs/releases/download/v1.0.1/hugo-events-cdk-constructs-1.0.1.tgz
 ```
-@hugo-events:registry=https://npm.pkg.github.com
-```
 
-and give npm a token with `read:packages` outside the repository:
-
-- **A developer:** once, `gh auth refresh -s read:packages`, then
-  `npm config set //npm.pkg.github.com/:_authToken "$(gh auth token)"` (writes `~/.npmrc`).
-- **CI:** the job's `GITHUB_TOKEN` with `packages: read`, written to `~/.npmrc` before `npm ci`.
-  The consumer repository needs read access on the package (package settings → Manage Actions
-  access).
+The lockfile pins the tarball's integrity. To upgrade, install the next release's URL.
 
 ## Releasing
 
-Bump `version` in `package.json`, merge, then tag that commit `v<version>` and push the tag. The
-Publish workflow checks the tag against `package.json`, tests, and publishes.
+Run `npm version <x.y.z> --no-git-tag-version` (it updates package.json and package-lock.json),
+update the README's example URL, merge, then tag that commit `v<version>` and push the tag. The
+Release workflow (release.yaml) checks the tag is on master and matches `package.json`, tests and
+packs with a read-only token, then attaches the tarball to the tag's release.
 
 ## Developing
 
